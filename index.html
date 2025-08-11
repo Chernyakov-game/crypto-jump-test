@@ -1,0 +1,89 @@
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Crypto Jump — Test</title>
+    <style>
+      html,body,#root,canvas{height:100%;margin:0;background:#000;color:#fff;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial}
+      .hud{position:fixed;left:12px;right:12px;top:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+      .pill{background:#111;border:1px solid #333;border-radius:10px;padding:6px 10px}
+      .btn{cursor:pointer}
+      .footer{position:fixed;left:12px;right:12px;bottom:12px;display:flex;justify-content:space-between;gap:8px}
+    </style>
+  </head>
+  <body>
+    <div class="hud">
+      <div class="pill">Balance USDT: <span id="bal">100.00</span></div>
+      <div class="pill">Asset: <span id="asset">USDT</span></div>
+      <div class="pill">Lag: <span id="lag">—</span> ms</div>
+      <div class="pill btn" id="panic">Panic to USDT</div>
+      <div class="pill">Fee model: 0.1% + 0.01 USDT</div>
+    </div>
+    <canvas id="cv"></canvas>
+    <div class="footer">
+      <div class="pill">Click a column to jump. Shift-click = 50%.</div>
+      <div class="pill">Demo only. Prices: Binance bookTicker.</div>
+    </div>
+    <script>
+      const TICKERS=['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','TONUSDT','XRPUSDT','ADAUSDT','DOGEUSDT'];
+      const qmap={};
+      let asset='USDT';
+      let balances={USDT:100};
+      const FEE_RATE=0.001; // 0.1%
+      const FEE_GAME=0.01;  // USDT fixed
+      const cv=document.getElementById('cv');
+      const ctx=cv.getContext('2d');
+      const elBal=document.getElementById('bal');
+      const elAsset=document.getElementById('asset');
+      const elLag=document.getElementById('lag');
+      document.getElementById('panic').onclick=()=>jump('USDT',1);
+
+      function fmt(n){return (Number(n)||0).toFixed(2)}
+      function mid(q){return (q.bid+q.ask)/2}
+      function quote(sym){return qmap[sym]}
+      function redraw(){elBal.textContent=fmt(balances.USDT||0); elAsset.textContent=asset}
+
+      function jump(toAsset, pct){
+        if(toAsset===asset)return;
+        const from=asset; const fromAmt=(balances[from]||0)*pct; if(fromAmt<=0)return;
+        // pick symbol and price
+        let sym,px; const now=Date.now();
+        if(from==='USDT'){ sym=toAsset+'USDT'; const q=quote(sym); if(!q||now-q.ts>1500)return alert('No fresh quote'); px=mid(q); const qty=fromAmt/px; balances[from]-=fromAmt; balances[toAsset]=(balances[toAsset]||0)+qty; }
+        else if(toAsset==='USDT'){ sym=from+'USDT'; const q=quote(sym); if(!q||now-q.ts>1500)return alert('No fresh quote'); px=mid(q); const usdt=fromAmt*px; balances[from]-=fromAmt; balances.USDT=(balances.USDT||0)+usdt; }
+        else { // via USDT same mid for demo
+          sym=from+'USDT'; const q=quote(sym); if(!q||now-q.ts>1500)return alert('No fresh quote'); px=mid(q); const usdt=fromAmt*px; const q2=quote(toAsset+'USDT'); if(!q2||now-q2.ts>1500)return alert('No fresh quote'); const px2=mid(q2); const qty=usdt/px2; balances[from]-=fromAmt; balances[toAsset]=(balances[toAsset]||0)+qty; }
+        // fees
+        const notionalUSDT = from==='USDT' ? fromAmt : (toAsset==='USDT' ? balances.USDT-(balances.USDT-fromAmt*px) : fromAmt*px);
+        const feeEx = notionalUSDT*FEE_RATE; if((balances.USDT||0)<FEE_GAME) return alert('Not enough USDT for game fee');
+        balances.USDT = (balances.USDT||0) - (feeEx + FEE_GAME);
+        asset=toAsset; redraw();
+      }
+
+      // canvas loop
+      function loop(){
+        cv.width=innerWidth; cv.height=innerHeight; const W=cv.width,H=cv.height; ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H);
+        const cw=Math.max(80,W/TICKERS.length-40);
+        TICKERS.forEach((sym,i)=>{
+          const x=(i*(W/TICKERS.length))+20; const y=H*0.6 + Math.sin((Date.now()/500)+(i*0.7))*H*0.15; const h=120;
+          ctx.fillStyle=(asset+'USDT'===sym || (asset==='USDT' && sym.endsWith('USDT')))?'#1e90ff':'#222';
+          ctx.fillRect(x,y,cw,h); ctx.strokeStyle='#555'; ctx.strokeRect(x,y,cw,h);
+          ctx.fillStyle='#fff'; ctx.font='bold 14px sans-serif'; ctx.fillText(sym,x+8,y+22);
+          const q=qmap[sym]; if(q){ ctx.fillText('mid: '+mid(q).toFixed(2),x+8,y+42); }
+        });
+        requestAnimationFrame(loop);
+      }
+
+      // click handler
+      cv.addEventListener('click', (e)=>{
+        const rect=cv.getBoundingClientRect(); const x=e.clientX-rect.left; const W=cv.width; const idx=Math.floor((x-20)/(W/TICKERS.length)); if(idx<0||idx>=TICKERS.length)return; const sym=TICKERS[idx]; const to=sym.replace('USDT',''); const pct=e.shiftKey?0.5:1; jump(to,pct);
+      });
+
+      // Binance WS multi-stream
+      const streams=TICKERS.map(s=>s.toLowerCase()+'@bookTicker').join('/');
+      const ws=new WebSocket('wss://stream.binance.com:9443/stream?streams='+streams);
+      let lastTs=0; ws.onmessage=(ev)=>{ const m=JSON.parse(ev.data); const d=m.data; qmap[d.s]={bid:Number(d.b),ask:Number(d.a),ts:Date.now()}; lastTs=qmap[d.s].ts; elLag.textContent=String(Math.max(0,Date.now()-lastTs)); };
+
+      redraw(); loop();
+    </script>
+  </body>
+</html>
