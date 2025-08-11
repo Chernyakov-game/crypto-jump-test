@@ -2,14 +2,13 @@
   <head>
     <meta charset="UTF-8"/>
     <meta name="viewport" content="width=device-width, initial-scale=1"/>
-    <title>Crypto Jump — Arcade Shitcoin Mode</title>
+    <title>Crypto Jump — Top Movers (Real Coins)</title>
     <style>
       html,body,#root,canvas{height:100%;margin:0;background:#000;color:#fff;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial}
       .hud{position:fixed;left:12px;right:12px;top:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;z-index:10}
       .pill{background:#111;border:1px solid #333;border-radius:10px;padding:6px 10px}
       .btn{cursor:pointer}
       .footer{position:fixed;left:12px;right:12px;bottom:12px;display:flex;justify-content:space-between;gap:8px;z-index:10}
-      a{color:#9ad}
     </style>
   </head>
   <body>
@@ -23,520 +22,213 @@
       <div class="pill">Stake: <span id="stake">25%</span> [1]=10 [2]=25 [3]=50 [4]=100</div>
 
       <div class="pill">
-        Shitcoin mode: <input id="mode" type="checkbox"/>
-        <span id="modeLbl">(off)</span>
+        Universe:
+        <button class="btn" id="uTop">Top Movers (Futures)</button>
+        <button class="btn" id="uMaj">Majors (Spot)</button>
+        <span id="uLbl">Top Movers</span>
       </div>
-      <div class="pill">Source: <span id="srcLbl">Spot</span></div>
-      <div class="pill">Arcade Multiplier:
-        <button class="btn" id="m1">1×</button>
-        <button class="btn" id="m2">2×</button>
-        <button class="btn" id="m3">3×</button>
-        <span id="mLbl">1×</span>
-      </div>
-      <div class="pill">Combo: <span id="comboLbl">0/3</span></div>
-      <div class="pill">[Space]=Jump to Leader</div>
+      <div class="pill">[Space]=Jump to current Leader</div>
       <div class="pill">Fee: 0.1% + 0.01 USDT</div>
     </div>
 
     <canvas id="cv"></canvas>
     <div class="footer">
-      <div class="pill">Click a column to jump. Shift-click = 50% once. Impulse glow = fast move.</div>
-      <div class="pill">Data: Binance <span id="apiLbl">Spot</span>. In Shitcoin mode: Binance Futures markPrice + 24h most volatile auto-rotation.</div>
+      <div class="pill">Click a column to jump. Shift-click = 50% once. Glow = fresh impulse.</div>
+      <div class="pill">Data: Binance (real). Futures markPrice in Top Movers, Spot bookTicker in Majors.</div>
     </div>
 
     <script>
-      // ---------- CONFIG ----------
-      const START_EQUITY = 100;
-      const FEE_RATE = 0.001;     // 0.1%
-      const FEE_GAME = 0.01;      // 0.01 USDT fixed
-      const TREND_WINDOW_MS = 3000;  // 3s trend for arrows
-      const HIST_MAX_MS = 20000;     // 20s sparkline window
-      const IMPULSE_MS = 1000;       // impulse check window
-      const IMPULSE_PCT = 0.003;     // 0.3% in 1s triggers pulse
-      const ROTATE_MS = 45000;       // shitcoin universe rotation
+      // -------- CONFIG
+      const START_EQUITY=100;
+      const FEE_RATE=0.001, FEE_GAME=0.01;
+      const TREND_MS=3000, HIST_MS=20000, IMPULSE_MS=1000, IMPULSE_PCT=0.003; // 0.3%/1s
+      const ROTATE_MS=20000; // обновляем топ каждые 20с
 
-      let SHITCOIN_MODE = false;     // toggle
-      let MULTIPLIER = 1;            // 1x/2x/3x Arcade
-      let winStreak = 0;             // consecutive profitable exits
-      let bonusReady = false;        // after 3 wins, +10% next profit
+      let MODE = 'TOP'; // 'TOP' or 'MAJ'
+      let TICKERS = ['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT','ADAUSDT','DOGEUSDT','TONUSDT']; // для Majors
+      let ws=null;
+      const qmap={}; // sym -> { mid, ts, hist[], impulse }
+      let asset='USDT';
+      let balances={USDT:100};
+      let stakePct=0.25;
 
-      // ---------- STATE ----------
-      let TICKERS = ['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','TONUSDT','XRPUSDT','ADAUSDT','DOGEUSDT']; // spot majors by default
-      let HOT_SYM = null;  // 24h most volatile addition
-      let ws = null;
+      let pos={asset:'USDT',qty:0,entryUSDT:0};
 
-      const qmap = {};     // symbol -> {mid, ts, hist: [{ts, mid}], impulse: boolean}
-      let asset = 'USDT';
-      let balances = { USDT: 100 };
-      let stakePct = 0.25;
+      // -------- DOM
+      const cv=document.getElementById('cv'), ctx=cv.getContext('2d');
+      const elBal=document.getElementById('bal');
+      const elAsset=document.getElementById('asset');
+      const elLag=document.getElementById('lag');
+      const elEq=document.getElementById('equity');
+      const elExit=document.getElementById('exitpnl');
+      const elStake=document.getElementById('stake');
+      const elULbl=document.getElementById('uLbl');
+      document.getElementById('panic').onclick=()=>jump('USDT',1);
+      document.getElementById('uTop').onclick=()=>{ MODE='TOP'; elULbl.textContent='Top Movers'; rebuildUniverse(true); };
+      document.getElementById('uMaj').onclick=()=>{ MODE='MAJ'; elULbl.textContent='Majors'; reopenWS(); };
 
-      // position tracking for "If exit now"
-      let pos = { asset: 'USDT', qty: 0, entryUSDT: 0, entryTs: 0 };
+      // -------- Utils
+      const now=()=>Date.now(), fmt=(n,d=2)=>(Number(n)||0).toFixed(d);
+      function redrawHUD(){ elBal.textContent=fmt(balances.USDT||0); elAsset.textContent=asset; elStake.textContent=Math.round(stakePct*100)+'%'; elEq.textContent=fmt(equityUSDT()); elExit.textContent=fmt(projectedExitPNL()); }
+      function equityUSDT(){ let s=0; for(const [k,v] of Object.entries(balances)){ if(k==='USDT') s+=v; else { const q=qmap[k+'USDT']; if(q) s+=v*q.mid; } } return s; }
+      function projectedExitPNL(){ if(asset==='USDT') return 0; const qty=balances[asset]||0; const q=qmap[asset+'USDT']; if(!q) return 0; const gross=qty*q.mid; const net=Math.max(0,gross*(1-FEE_RATE)-FEE_GAME); const entry=(pos.asset===asset)?pos.entryUSDT:0; return net-entry; }
 
-      // ---------- DOM ----------
-      const cv = document.getElementById('cv'); const ctx = cv.getContext('2d');
-      const elBal = document.getElementById('bal');
-      const elAsset = document.getElementById('asset');
-      const elLag = document.getElementById('lag');
-      const elEquity = document.getElementById('equity');
-      const elExit = document.getElementById('exitpnl');
-      const elStake = document.getElementById('stake');
-      const elMode = document.getElementById('mode');
-      const elModeLbl = document.getElementById('modeLbl');
-      const elSrcLbl = document.getElementById('srcLbl');
-      const elApiLbl = document.getElementById('apiLbl');
-      const elM1 = document.getElementById('m1');
-      const elM2 = document.getElementById('m2');
-      const elM3 = document.getElementById('m3');
-      const elMLbl = document.getElementById('mLbl');
-      const elCombo = document.getElementById('comboLbl');
+      // -------- Game logic
+      function updatePositionOnBuy(sym, qty, netUSDT){ if(pos.asset!==sym) pos={asset:sym,qty:0,entryUSDT:0}; pos.qty+=qty; pos.entryUSDT+=netUSDT; }
+      function reducePositionOnSell(sym, qty){ if(pos.asset!==sym||pos.qty<=0) return; const p=Math.min(1,qty/pos.qty); pos.qty-=qty; pos.entryUSDT*= (1-p); if(pos.qty<=1e-12) pos={asset:'USDT',qty:0,entryUSDT:0}; }
 
-      document.getElementById('panic').onclick = () => jump('USDT', 1);
-
-      elM1.onclick = () => setMultiplier(1);
-      elM2.onclick = () => setMultiplier(2);
-      elM3.onclick = () => setMultiplier(3);
-
-      elMode.onchange = () => {
-        SHITCOIN_MODE = elMode.checked;
-        elModeLbl.textContent = SHITCOIN_MODE ? '(on)' : '(off)';
-        elSrcLbl.textContent = SHITCOIN_MODE ? 'Futures' : 'Spot';
-        elApiLbl.textContent = SHITCOIN_MODE ? 'Futures' : 'Spot';
-        // rebuild universe and reconnect
-        rebuildUniverse(true);
-      };
-
-      function setMultiplier(x){
-        MULTIPLIER = x;
-        elMLbl.textContent = `${x}×`;
-      }
-
-      // ---------- UTILS ----------
-      const now = () => Date.now();
-      const fmt = (n,d=2)=> (Number(n)||0).toFixed(d);
-
-      function redrawHUD(){
-        elBal.textContent = fmt(balances.USDT||0);
-        elAsset.textContent = asset;
-        elStake.textContent = Math.round(stakePct*100)+'%';
-        elEquity.textContent = fmt(equityUSDT());
-        elExit.textContent = fmt(projectedExitPNL());
-        elCombo.textContent = `${Math.min(winStreak,3)}/3` + (bonusReady ? ' +10% READY' : '');
-      }
-
-      function equityUSDT(){
-        let total=0;
-        for(const [k,v] of Object.entries(balances)){
-          if(k==='USDT'){ total+=v; continue; }
-          const q = qmap[k+'USDT']; if(q) total += v * q.mid;
-        }
-        return total;
-      }
-
-      function projectedExitPNL(){
-        if(asset==='USDT') return 0;
-        const qty = balances[asset] || 0;
-        const q = qmap[asset+'USDT']; if(!q) return 0;
-        const gross = qty * q.mid;
-        const net = Math.max(0, gross * (1 - FEE_RATE) - FEE_GAME);
-        const entry = (pos.asset===asset) ? pos.entryUSDT : 0;
-        let pnl = net - entry;
-        // show how Arcade/Bonus would affect positive pnl if exiting now
-        if(pnl > 0){
-          if(bonusReady) pnl *= 1.10;
-          pnl *= MULTIPLIER;
-        }
-        return pnl;
-      }
-
-      function updatePositionOnBuy(toAsset, qtyBought, netUSDTSpent){
-        if(pos.asset!==toAsset) pos = { asset: toAsset, qty: 0, entryUSDT: 0, entryTs: 0 };
-        pos.qty += qtyBought;
-        pos.entryUSDT += netUSDTSpent;
-        pos.entryTs = now();
-      }
-      function clearPosition(){ pos = { asset: 'USDT', qty: 0, entryUSDT: 0, entryTs: 0 }; }
-      function reducePositionOnSell(fromAsset, qtySold){
-        if(pos.asset!==fromAsset || pos.qty<=0) return;
-        const portion = Math.min(1, qtySold / pos.qty);
-        pos.qty -= qtySold;
-        pos.entryUSDT *= (1 - portion);
-        if(pos.qty<=1e-12) clearPosition();
-      }
-
-      // ---------- GAME LOGIC ----------
       function jump(toAsset, pctOverride){
         const pct = typeof pctOverride==='number' ? pctOverride : stakePct;
         if(toAsset===asset) return;
-        const from=asset;
-        const fromAmt=(balances[from]||0)*pct;
-        if(fromAmt<=0) return;
+        const from=asset, fromAmt=(balances[from]||0)*pct; if(fromAmt<=0) return;
+        const fresh=(sym)=>{ const q=qmap[sym]; return q && now()-q.ts<=1500; };
 
-        const fresh = (sym) => {
-          const q = qmap[sym]; return q && now() - q.ts <= 1500;
-        };
-
-        if(from==='USDT'){ 
-          const sym = toAsset+'USDT'; if(!fresh(sym)) return alert('No fresh quote');
-          const q = qmap[sym];
-          const notionalUSDT = fromAmt;
-          const feeEx = notionalUSDT*FEE_RATE;
-          const feeGame = FEE_GAME;
-          const netUSDT = notionalUSDT - feeEx - feeGame;
-          if(netUSDT<=0) return alert('Too small amount for fees');
-          const qty = netUSDT / q.mid;
-
-          balances.USDT -= fromAmt;
-          balances[toAsset]=(balances[toAsset]||0)+qty;
-          updatePositionOnBuy(toAsset, qty, netUSDT);
-
+        if(from==='USDT'){
+          const s=toAsset+'USDT'; if(!fresh(s)) return alert('No fresh quote');
+          const q=qmap[s]; const notional=fromAmt; const net=notional - notional*FEE_RATE - FEE_GAME; if(net<=0) return;
+          const qty=net/q.mid; balances.USDT-=fromAmt; balances[toAsset]=(balances[toAsset]||0)+qty; updatePositionOnBuy(toAsset, qty, net);
         } else if(toAsset==='USDT'){
-          const sym = from+'USDT'; if(!fresh(sym)) return alert('No fresh quote');
-          const q = qmap[sym];
-          const grossUSDT = fromAmt * q.mid;
-          const feeEx = grossUSDT*FEE_RATE;
-          const feeGame = FEE_GAME;
-          let netUSDT = Math.max(0, grossUSDT - feeEx - feeGame);
-
-          // Arcade multiplier and Combo only on positive PnL relative to entry
-          if(pos.asset===from){
-            const entryPortion = pos.entryUSDT * (fromAmt / Math.max(pos.qty, fromAmt)); // proportional entry for this sold slice
-            let pnl = netUSDT - entryPortion;
-            if(pnl > 0){
-              if(bonusReady){ pnl *= 1.10; bonusReady = false; winStreak = 0; }
-              pnl *= MULTIPLIER;
-            }
-            netUSDT = entryPortion + pnl; // losses не умножаем
-          }
-
-          balances[from] -= fromAmt;
-          balances.USDT = (balances.USDT||0) + netUSDT;
-
-          // streaks
-          const realizedPnl = (pos.asset===from) ? (netUSDT - (pos.entryUSDT * (fromAmt / Math.max(pos.qty||fromAmt, fromAmt)))) : 0;
-          if(realizedPnl > 0){
-            winStreak = Math.min(winStreak + 1, 3);
-            if(winStreak >= 3) bonusReady = true; // даст +10% на следующий профит
-          } else {
-            winStreak = 0;
-            bonusReady = false;
-          }
-
-          reducePositionOnSell(from, fromAmt);
-          if((balances[from]||0)<=1e-12 && asset!==toAsset) clearPosition();
-
+          const s=from+'USDT'; if(!fresh(s)) return alert('No fresh quote');
+          const q=qmap[s]; const gross=fromAmt*q.mid; const net=Math.max(0,gross - gross*FEE_RATE - FEE_GAME);
+          balances[from]-=fromAmt; balances.USDT=(balances.USDT||0)+net; reducePositionOnSell(from, fromAmt);
         } else {
-          // from -> USDT -> toAsset
-          const s1 = from+'USDT', s2 = toAsset+'USDT';
-          if(!fresh(s1)||!fresh(s2)) return alert('No fresh quote');
-          const q1 = qmap[s1], q2 = qmap[s2];
-
-          const grossUSDT = fromAmt * q1.mid;
-          const feeEx1 = grossUSDT*FEE_RATE, feeGame1 = FEE_GAME;
-          const midUSDT = Math.max(0, grossUSDT - feeEx1 - feeGame1);
-
-          const feeEx2 = midUSDT*FEE_RATE, feeGame2 = FEE_GAME;
-          const netUSDT = Math.max(0, midUSDT - feeEx2 - feeGame2);
-          const qty = netUSDT / q2.mid;
-
-          balances[from] -= fromAmt;
-          balances[toAsset]=(balances[toAsset]||0)+qty;
-
-          // streak logic: treat from->USDT leg as realized
-          const entryPart = (pos.asset===from) ? pos.entryUSDT * (fromAmt / Math.max(pos.qty||fromAmt, fromAmt)) : 0;
-          const realizedPnl = (pos.asset===from) ? (midUSDT - entryPart) : 0;
-          if(realizedPnl > 0){
-            winStreak = Math.min(winStreak + 1, 3);
-            if(winStreak >= 3) bonusReady = true;
-          } else if(realizedPnl < 0){
-            winStreak = 0; bonusReady = false;
-          }
-
-          reducePositionOnSell(from, fromAmt);
-          updatePositionOnBuy(toAsset, qty, netUSDT);
+          const s1=from+'USDT', s2=toAsset+'USDT'; if(!fresh(s1)||!fresh(s2)) return alert('No fresh quote');
+          const q1=qmap[s1], q2=qmap[s2]; const midUSDT=Math.max(0, fromAmt*q1.mid - (fromAmt*q1.mid)*FEE_RATE - FEE_GAME);
+          const net=Math.max(0, midUSDT - midUSDT*FEE_RATE - FEE_GAME); const qty=net/q2.mid;
+          balances[from]-=fromAmt; balances[toAsset]=(balances[toAsset]||0)+qty; reducePositionOnSell(from, fromAmt); updatePositionOnBuy(toAsset, qty, net);
         }
-
-        asset=toAsset;
-        redrawHUD();
+        asset=toAsset; redrawHUD();
       }
 
-      // ---------- VISUALS ----------
-      function trendPct(sym, windowMs=TREND_WINDOW_MS){
-        const q = qmap[sym]; if(!q || !q.hist || q.hist.length<2) return 0;
-        const t = now();
-        let base = q.hist[0];
-        for(let i=q.hist.length-1;i>=0;i--){
-          if(t - q.hist[i].ts >= windowMs){ base = q.hist[i]; break; }
-          base = q.hist[0];
-        }
-        const b = base.mid || 0; if(!b) return 0;
-        return (q.mid - b)/b * 100;
-      }
+      // -------- Trends / visuals
+      function trendPct(sym, win=TREND_MS){ const q=qmap[sym]; if(!q||!q.hist||q.hist.length<2) return 0; const t=now(); let base=q.hist[0]; for(let i=q.hist.length-1;i>=0;i--){ if(t-q.hist[i].ts>=win){ base=q.hist[i]; break; } base=q.hist[0]; } const b=base.mid||0; return b? (q.mid-b)/b*100 : 0; }
+      function bestAndWorst(){ let best={sym:null,pct:-Infinity}, worst={sym:null,pct:Infinity}; for(const s of getCurrentUniverse()){ const p=trendPct(s); if(p>best.pct) best={sym:s,pct:p}; if(p<worst.pct) worst={sym:s,pct:p}; } return {best,worst}; }
+      function drawSpark(sym,x,y,w,h){ const q=qmap[sym]; if(!q||!q.hist||q.hist.length<2) return; const hist=q.hist; let min=Infinity,max=-Infinity; for(const p of hist){ if(p.mid<min) min=p.mid; if(p.mid>max) max=p.mid; } if(min===max){ min-=1e-9; max+=1e-9; } ctx.beginPath(); for(let i=0;i<hist.length;i++){ const p=hist[i]; const tNorm=(p.ts-hist[0].ts)/((hist[hist.length-1].ts-hist[0].ts)||1); const xx=x+tNorm*w; const yy=y+h-((p.mid-min)/(max-min))*h; if(i===0) ctx.moveTo(xx,yy); else ctx.lineTo(xx,yy);} ctx.strokeStyle='#aaa'; ctx.lineWidth=1; ctx.stroke(); }
 
-      function bestAndWorst(){
-        let best={sym:null,pct:-Infinity}, worst={sym:null,pct:Infinity};
-        for(const s of TICKERS){
-          const p=trendPct(s);
-          if(p>best.pct) best={sym:s,pct:p};
-          if(p<worst.pct) worst={sym:s,pct:p};
-        }
-        return {best,worst};
-      }
-
-      function drawSpark(sym, x, y, w, h){
-        const q=qmap[sym];
-        if(!q || !q.hist || q.hist.length<2) return;
-        const hist=q.hist;
-        let min=Infinity, max=-Infinity;
-        for(const p of hist){ if(p.mid<min) min=p.mid; if(p.mid>max) max=p.mid; }
-        if(min===max){ min -= 1e-9; max += 1e-9; }
-        ctx.beginPath();
-        for(let i=0;i<hist.length;i++){
-          const p=hist[i];
-          const tNorm=(p.ts - hist[0].ts) / (hist[hist.length-1].ts - hist[0].ts || 1);
-          const xx = x + tNorm * w;
-          const yy = y + h - ((p.mid - min)/(max - min)) * h;
-          if(i===0) ctx.moveTo(xx,yy); else ctx.lineTo(xx,yy);
-        }
-        ctx.strokeStyle='#aaa'; ctx.lineWidth=1; ctx.stroke();
-      }
-
-      let lastEquity=START_EQUITY, animEquity=START_EQUITY;
+      let lastEq=START_EQUITY, animEq=START_EQUITY;
 
       function loop(){
-        cv.width=innerWidth; cv.height=innerHeight;
-        const W=cv.width, H=cv.height;
+        cv.width=innerWidth; cv.height=innerHeight; const W=cv.width,H=cv.height;
         ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H);
 
-        const {best,worst}=bestAndWorst();
+        const uni=getCurrentUniverse(); const {best,worst}=bestAndWorst();
 
-        // Wallet column
-        const eq = equityUSDT(); animEquity += (eq - animEquity) * 0.15;
-        const colH = 160 + Math.max(0, animEquity - START_EQUITY) * (80/50);
-        const walletX=20, walletW=Math.min(120, Math.max(90, W*0.08));
-        const walletColor = eq > lastEquity + 0.01 ? '#2ecc71' : (eq < lastEquity - 0.01 ? '#e74c3c' : '#1e90ff');
-        const wy = H - colH - 40;
+        // Wallet
+        const eq=equityUSDT(); animEq += (eq-animEq)*0.15;
+        const colH=160 + Math.max(0, animEq-START_EQUITY)*(80/50);
+        const wx=20, ww=Math.min(120, Math.max(90, W*0.08)), wy=H-colH-40;
+        const wcol = eq>lastEq+0.01?'#2ecc71':(eq<lastEq-0.01?'#e74c3c':'#1e90ff');
+        ctx.fillStyle=wcol; ctx.fillRect(wx,wy,ww,colH); ctx.strokeStyle='#555'; ctx.strokeRect(wx,wy,ww,colH);
+        ctx.fillStyle='#fff'; ctx.font='bold 14px sans-serif'; ctx.fillText('WALLET', wx+8, wy+20); ctx.fillText('Eq: '+fmt(eq), wx+8, wy+40); ctx.fillText('PnL: '+fmt(((eq-START_EQUITY)/START_EQUITY)*100,1)+'%', wx+8, wy+60);
 
-        ctx.fillStyle=walletColor; ctx.fillRect(walletX, wy, walletW, colH);
-        ctx.strokeStyle='#555'; ctx.lineWidth=1; ctx.strokeRect(walletX, wy, walletW, colH);
-        ctx.fillStyle='#fff'; ctx.font='bold 14px sans-serif';
-        ctx.fillText('WALLET', walletX+8, wy+20);
-        ctx.fillText('Eq: '+fmt(eq), walletX+8, wy+40);
-        const pnlPct=((eq-START_EQUITY)/START_EQUITY)*100;
-        ctx.fillText('PnL: '+fmt(pnlPct,1)+'%', walletX+8, wy+60);
+        // Columns
+        const usable = W-(wx+ww+30)-20; const startX=wx+ww+30; const cw=Math.max(100, usable/uni.length - 20); const baseY=H*0.65;
 
-        // Tickers columns
-        const usableWidth = W - (walletX + walletW + 30) - 20;
-        const startX = walletX + walletW + 30;
-        const cw = Math.max(100, usableWidth / TICKERS.length - 20);
-        const baseYCols = H*0.65;
-
-        TICKERS.forEach((sym,i)=>{
-          const chg = trendPct(sym);
-          const isLeader = best.sym===sym;
-          const isWorst  = worst.sym===sym;
-
-          // impulse detector 1s window
+        uni.forEach((sym,i)=>{
+          const chg=trendPct(sym);
           const impulse = Math.abs(trendPct(sym, IMPULSE_MS)) >= (IMPULSE_PCT*100);
+          const boost = Math.max(-1, Math.min(1, chg/1.5)); const h=120+boost*30;
+          const x=startX+i*(cw+20), y=baseY-h/2;
 
-          const trendBoost = Math.max(-1, Math.min(1, chg/1.5));
-          const h = 120 + trendBoost * 30;
-          const x = startX + i*(cw+20);
-          const y = baseYCols - h/2;
+          let fill='#151515'; if(chg>0.02) fill='#143d1f'; if(chg<-0.02) fill='#3a1515';
+          if(!impulse) fill='#0d0d0d'; // «усыпляем» без импульса
+          ctx.fillStyle=fill; ctx.fillRect(x,y,cw,h);
 
-          // fill by trend
-          let fill='#222'; if(chg>0.02) fill='#143d1f'; if(chg<-0.02) fill='#3a1515';
-          ctx.fillStyle = fill; ctx.fillRect(x,y,cw,h);
-
-          // borders priority: current > leader > HOT > worst > default
-          const isCurrent = (asset+'USDT'===sym) || (asset==='USDT' && sym.endsWith('USDT'));
-          if (isCurrent){ ctx.strokeStyle='#00d9ff'; ctx.lineWidth=4; }
-          else if (isLeader){ ctx.strokeStyle='#00ffae'; ctx.lineWidth=3; }
-          else if (HOT_SYM===sym){ ctx.strokeStyle='#ffd54a'; ctx.lineWidth=3; }
-          else if (isWorst){ ctx.strokeStyle='#ff3b3b'; ctx.lineWidth=2; }
+          const isCurrent=(asset+'USDT'===sym)||(asset==='USDT'&&sym.endsWith('USDT'));
+          if(isCurrent){ ctx.strokeStyle='#00d9ff'; ctx.lineWidth=4; }
+          else if(best.sym===sym){ ctx.strokeStyle='#00ffae'; ctx.lineWidth=3; }
+          else if(worst.sym===sym){ ctx.strokeStyle='#ff3b3b'; ctx.lineWidth=2; }
           else { ctx.strokeStyle='#555'; ctx.lineWidth=1; }
-          ctx.strokeRect(x,y,cw,h);
-          ctx.lineWidth=1;
+          ctx.strokeRect(x,y,cw,h); ctx.lineWidth=1;
 
-          // glow for impulse
-          if(impulse){
-            ctx.globalAlpha = 0.28;
-            ctx.strokeStyle = '#ffea00';
-            ctx.lineWidth = 10;
-            ctx.strokeRect(x-3, y-3, cw+6, h+6);
-            ctx.globalAlpha = 1;
-          }
+          if(impulse){ ctx.globalAlpha=0.28; ctx.strokeStyle='#ffea00'; ctx.lineWidth=10; ctx.strokeRect(x-3,y-3,cw+6,h+6); ctx.globalAlpha=1; }
 
-          // labels
           ctx.fillStyle='#fff'; ctx.font='bold 14px sans-serif';
-          const hotTag = (HOT_SYM===sym) ? ' [HOT]' : '';
-          ctx.fillText(sym + hotTag, x+8, y+20);
-          const q=qmap[sym];
-          if(q){
-            ctx.fillText('px: '+fmt(q.mid), x+8, y+38);
-            const arrow = chg>0 ? '↑' : (chg<0 ? '↓' : '→');
-            ctx.fillStyle = chg>0 ? '#2ecc71' : (chg<0 ? '#e74c3c' : '#d0d0d0');
-            ctx.fillText(`${arrow} ${fmt(chg,2)}%/3s`, x+8, y+56);
-            drawSpark(sym, x+8, y+h-34, cw-16, 26);
-            if (isCurrent){ ctx.fillStyle='#00d9ff'; ctx.fillText('[YOU]', x+cw-60, y+20); }
-          }
+          ctx.fillText(sym, x+8, y+20);
+          const q=qmap[sym]; if(q){ ctx.fillText('px: '+fmt(q.mid), x+8, y+38); const arrow=chg>0?'↑':(chg<0?'↓':'→'); ctx.fillStyle=chg>0?'#2ecc71':(chg<0?'#e74c3c':'#d0d0d0'); ctx.fillText(`${arrow} ${fmt(chg,2)}%/3s`, x+8, y+56); drawSpark(sym, x+8, y+h-34, cw-16, 26); if(isCurrent){ ctx.fillStyle='#00d9ff'; ctx.fillText('[YOU]', x+cw-60, y+20); } }
         });
 
-        lastEquity=eq;
-        requestAnimationFrame(loop);
+        lastEq=eq; requestAnimationFrame(loop);
       }
 
-      // ---------- INPUT ----------
-      cv.addEventListener('click', (e)=>{
-        const rect=cv.getBoundingClientRect(); const x=e.clientX-rect.left; const y=e.clientY-rect.top;
-        const W=cv.width, H=cv.height;
+      function getCurrentUniverse(){
+        return MODE==='TOP' ? (window.__TOP8__ || TICKERS.slice(0,8)) : TICKERS;
+      }
 
-        // ignore wallet
-        const walletX=20, walletW=Math.min(120, Math.max(90, W*0.08));
-        const colH = 160 + Math.max(0, equityUSDT() - START_EQUITY) * (80/50);
-        const wy = H - colH - 40;
-        if(x>=walletX && x<=walletX+walletW && y>=wy && y<=wy+colH) return;
-
-        const usableWidth = W - (walletX + walletW + 30) - 20;
-        const startX = walletX + walletW + 30;
-        const cw = Math.max(100, usableWidth / TICKERS.length - 20);
-        const stride = cw + 20;
-        const idx = Math.floor((x - startX) / stride);
-        if(idx < 0 || idx >= TICKERS.length) return;
-
-        // hit test by actual height
-        const sym = TICKERS[idx];
-        const chg = trendPct(sym);
-        const trendBoost = Math.max(-1, Math.min(1, chg/1.5));
-        const ch = 120 + trendBoost * 30;
-        const colX = startX + idx*stride;
-        const colY = H*0.65 - ch/2;
-        if(!(x>=colX && x<=colX+cw && y>=colY && y<=colY+ch)) return;
-
-        const to = sym.replace('USDT','');
-        const pct = e.shiftKey ? 0.5 : undefined;
-        jump(to, pct);
+      // -------- Input
+      cv.addEventListener('click',(e)=>{
+        const r=cv.getBoundingClientRect(); const x=e.clientX-r.left, y=e.clientY-r.top; const W=cv.width,H=cv.height;
+        const uni=getCurrentUniverse();
+        const wx=20, ww=Math.min(120, Math.max(90, W*0.08));
+        const colH=160 + Math.max(0, equityUSDT()-START_EQUITY)*(80/50); const wy=H-colH-40;
+        if(x>=wx&&x<=wx+ww&&y>=wy&&y<=wy+colH) return;
+        const usable=W-(wx+ww+30)-20, startX=wx+ww+30, cw=Math.max(100, usable/uni.length - 20), stride=cw+20;
+        const idx=Math.floor((x-startX)/stride); if(idx<0||idx>=uni.length) return;
+        const sym=uni[idx]; const chg=trendPct(sym); const boost=Math.max(-1,Math.min(1,chg/1.5)); const ch=120+boost*30; const colX=startX+idx*stride; const colY=H*0.65 - ch/2;
+        if(!(x>=colX&&x<=colX+cw&&y>=colY&&y<=colY+ch)) return;
+        jump(sym.replace('USDT',''), e.shiftKey?0.5:undefined);
       });
 
-      window.addEventListener('keydown', (e)=>{
+      window.addEventListener('keydown',(e)=>{
         if(e.key==='1'){ stakePct=0.10; redrawHUD(); }
         if(e.key==='2'){ stakePct=0.25; redrawHUD(); }
         if(e.key==='3'){ stakePct=0.50; redrawHUD(); }
         if(e.key==='4'){ stakePct=1.00;  redrawHUD(); }
-        if(e.code==='Space'){
-          e.preventDefault();
-          const {best} = bestAndWorst();
-          if(best.sym){ jump(best.sym.replace('USDT','')); }
-        }
+        if(e.code==='Space'){ e.preventDefault(); const {best}=bestAndWorst(); if(best.sym) jump(best.sym.replace('USDT','')); }
       });
 
-      // ---------- DATA FEEDS ----------
+      // -------- Data feeds
       function reopenWS(){
-        try { ws && ws.close(); } catch {}
-        const streamList = TICKERS.map(s => {
-          return SHITCOIN_MODE
-            ? s.toLowerCase()+'@markPrice'      // Futures mark price stream
-            : s.toLowerCase()+'@bookTicker';    // Spot best bid/ask
-        }).join('/');
-        const base = SHITCOIN_MODE ? 'wss://fstream.binance.com/stream?streams='
-                                   : 'wss://stream.binance.com:9443/stream?streams=';
-        ws = new WebSocket(base + streamList);
-
-        ws.onmessage = (ev)=>{
-          const m = JSON.parse(ev.data);
-          const t = now();
-          // Spot: m.data = { s, b, a } ; Futures: m.data = { s, p, ... }
-          const d = m.data || m; // иногда проксирует без data
-          const sym = d.s;
-          let px;
-          if (SHITCOIN_MODE){
-            px = Number(d.p); // mark price
-          } else {
-            px = (Number(d.b)+Number(d.a))/2;
-          }
-
-          const prev = qmap[sym];
-          const entry = { mid:px, ts:t, hist:(prev?.hist||[]) };
-          entry.hist.push({ts:t, mid:px});
-          const cutoff = t - HIST_MAX_MS;
-          while(entry.hist.length && entry.hist[0].ts < cutoff) entry.hist.shift();
-
-          // impulse flag
-          let imp = false;
-          if (entry.hist.length>2){
-            // сравним с точкой примерно секунду назад
-            let base = entry.hist[0];
-            for(let i=entry.hist.length-1;i>=0;i--){
-              if(t - entry.hist[i].ts >= IMPULSE_MS){ base = entry.hist[i]; break; }
-            }
-            const b = base.mid||0;
-            if(b>0 && Math.abs((px-b)/b) >= IMPULSE_PCT) imp = true;
-          }
-          entry.impulse = imp;
-
-          qmap[sym] = entry;
-
-          elLag.textContent = String(Math.max(0, now()-t));
-          elEquity.textContent = fmt(equityUSDT());
-          elExit.textContent = fmt(projectedExitPNL());
+        try{ ws&&ws.close(); }catch{}
+        const uni=getCurrentUniverse();
+        const streams = (MODE==='TOP'
+          ? uni.map(s=>s.toLowerCase()+'@markPrice').join('/')
+          : uni.map(s=>s.toLowerCase()+'@bookTicker').join('/')
+        );
+        const base = (MODE==='TOP'
+          ? 'wss://fstream.binance.com/stream?streams='
+          : 'wss://stream.binance.com:9443/stream?streams='
+        );
+        ws = new WebSocket(base+streams);
+        ws.onmessage=(ev)=>{
+          const m=JSON.parse(ev.data), t=now(), d=m.data||m, sym=d.s;
+          const px = (MODE==='TOP') ? Number(d.p) : (Number(d.b)+Number(d.a))/2;
+          const prev=qmap[sym]; const entry={mid:px,ts:t,hist:(prev?.hist||[])};
+          entry.hist.push({ts:t,mid:px}); const cut=t-HIST_MS; while(entry.hist.length&&entry.hist[0].ts<cut) entry.hist.shift();
+          // impulse
+          let imp=false; if(entry.hist.length>2){ let base=entry.hist[0]; for(let i=entry.hist.length-1;i>=0;i--){ if(t-entry.hist[i].ts>=IMPULSE_MS){ base=entry.hist[i]; break;} } const b=base.mid||0; if(b>0 && Math.abs((px-b)/b)>=IMPULSE_PCT) imp=true; }
+          entry.impulse=imp; qmap[sym]=entry;
+          elLag.textContent=String(Math.max(0, now()-t)); elEq.textContent=fmt(equityUSDT()); elExit.textContent=fmt(projectedExitPNL());
         };
       }
 
-      async function pickMostVolatile(){
+      async function fetchTop8Futures(){
         try{
-          // 24h ticker: Spot or Futures endpoint
-          const url = SHITCOIN_MODE
-            ? 'https://fapi.binance.com/fapi/v1/ticker/24hr'
-            : 'https://api.binance.com/api/v3/ticker/24hr';
-
-          const res = await fetch(url);
-          const all = await res.json();
-
-          // USDT pairs, price < 1, 24h quoteVolume > 10M, exclude leveraged tokens (mostly spot)
-          const bad = /(UPUSDT|DOWNUSDT|BULLUSDT|BEARUSDT|[0-9]LUSDT|[0-9]SUSDT|USDTUSDT)$/i;
-          const usdt = all.filter(r => {
-            const sym = r.symbol || r.s;
-            if (!sym || !sym.endsWith('USDT')) return false;
-            if (bad.test(sym)) return false;
-            const last = Number(r.lastPrice || r.c || 0);
-            const volQuote = Number(r.quoteVolume || r.q || 0);
-            return last > 0 && last < 1 && volQuote >= 10_000_000;
-          });
-
-          // volatility score by absolute 24h % change
-          usdt.sort((a,b)=> Math.abs(Number(b.priceChangePercent || b.P)) - Math.abs(Number(a.priceChangePercent || a.P)));
-
-          const pick = usdt.find(r => !TICKERS.includes(r.symbol || r.s));
-          if(!pick) return null;
-          return pick.symbol || pick.s;
-        } catch(e){
-          console.warn('pickMostVolatile failed', e);
-          return null;
-        }
+          const res=await fetch('https://fapi.binance.com/fapi/v1/ticker/24hr');
+          const all=await res.json();
+          // фильтр: USDT-пары, цена < 0.5, quoteVolume > 10M, без левередж-токенов
+          const bad=/(UPUSDT|DOWNUSDT|BULLUSDT|BEARUSDT|[0-9]LUSDT|[0-9]SUSDT|USDTUSDT)$/i;
+          const arr=all.filter(r=>{
+            const s=r.symbol; if(!s||!s.endsWith('USDT')) return false;
+            if(bad.test(s)) return false;
+            const last=Number(r.lastPrice||0), qv=Number(r.quoteVolume||0);
+            return last>0 && last<0.5 && qv>=10_000_000;
+          }).sort((a,b)=> Math.abs(Number(b.priceChangePercent||0)) - Math.abs(Number(a.priceChangePercent||0)));
+          return arr.slice(0,8).map(r=>r.symbol);
+        }catch(e){ console.warn('fetchTop8Futures failed', e); return null; }
       }
 
-      async function rebuildUniverse(reconnect=false){
-        if(SHITCOIN_MODE){
-          // keep 6 majors for reference + add two HOTs
-          TICKERS = ['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT','DOGEUSDT'];
-          const hot1 = await pickMostVolatile();
-          if (hot1){ HOT_SYM = hot1; TICKERS.push(hot1); }
-          const hot2 = await pickMostVolatile();
-          if (hot2 && hot2!==hot1){ TICKERS.push(hot2); }
-        } else {
-          HOT_SYM = null;
-          TICKERS = ['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','TONUSDT','XRPUSDT','ADAUSDT','DOGEUSDT'];
+      async function rebuildUniverse(reconnect){
+        if(MODE==='TOP'){
+          const top = await fetchTop8Futures();
+          window.__TOP8__ = top && top.length ? top : window.__TOP8__ || ['PEPEUSDT','SHIBUSDT','1000SATSUSDT','WIFUSDT','FLOKIUSDT','ENSUSDT','ARKMUSDT','SSVUSDT'];
         }
         if(reconnect) reopenWS();
       }
 
-      // periodic rotation in shitcoin mode
-      setInterval(async ()=>{
-        if(!SHITCOIN_MODE) return;
-        await rebuildUniverse(true);
-      }, ROTATE_MS);
+      setInterval(()=>{ if(MODE==='TOP') rebuildUniverse(true); }, ROTATE_MS);
 
-      // ---------- START ----------
+      // -------- Start
       redrawHUD();
       rebuildUniverse(false);
       reopenWS();
