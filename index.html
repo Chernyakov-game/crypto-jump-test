@@ -26,12 +26,16 @@
     <canvas id="cv"></canvas>
     <div class="footer">
       <div class="pill">Click a column to jump. Shift-click = 50% once.</div>
-      <div class="pill">Demo only. Prices: Binance bookTicker.</div>
+      <div class="pill">Demo only. Prices: Binance bookTicker. Adds 24h most-volatile [HOT].</div>
     </div>
+
     <script>
-      const TICKERS=['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','TONUSDT','XRPUSDT','ADAUSDT','DOGEUSDT'];
-      // по символу храним: bid, ask, ts, mid, hist (последние 20с)
-      const qmap={};
+      // ---------- CONFIG / STATE ----------
+      let TICKERS=['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','TONUSDT','XRPUSDT','ADAUSDT','DOGEUSDT'];
+      let HOT_SYM = null; // добавим самую волатильную 24h сюда
+      let ws = null;
+
+      const qmap={}; // symbol -> {bid, ask, mid, ts, hist: [{ts,mid}, ...]}
       let asset='USDT';
       let balances={USDT:100};
       let stakePct=0.25; // 25% по умолчанию
@@ -42,10 +46,10 @@
       const TREND_WINDOW_MS = 5000;   // 5s тренд
       const HIST_MAX_MS = 20000;      // 20s спарклайн
 
-      // учёт позиции для «If exit now»
-      // трекаем среднюю цену входа в USDT и количество по текущему asset
+      // позиция для "If exit now"
       let pos = { asset: 'USDT', qty: 0, entryUSDT: 0 };
 
+      // ---------- DOM ----------
       const cv=document.getElementById('cv');
       const ctx=cv.getContext('2d');
       const elBal=document.getElementById('bal');
@@ -57,10 +61,11 @@
 
       document.getElementById('panic').onclick=()=>jump('USDT',1);
 
-      function fmt(n, d=2){return (Number(n)||0).toFixed(d)}
-      function mid(q){return (q.bid+q.ask)/2}
-      function qget(sym){return qmap[sym]}
-      function now(){return Date.now()}
+      // ---------- UTILS ----------
+      const now=()=>Date.now();
+      const fmt=(n,d=2)=> (Number(n)||0).toFixed(d);
+      const mid=(q)=> (q.bid+q.ask)/2;
+      const qget=(sym)=> qmap[sym];
 
       function redrawHUD(){
         elBal.textContent=fmt(balances.USDT||0);
@@ -70,50 +75,40 @@
         elExit.textContent = fmt(projectedExitPNL());
       }
 
-      // Equity в USDT
       function equityUSDT(){
-        let total = 0;
+        let total=0;
         for(const [k,v] of Object.entries(balances)){
-          if(k==='USDT'){ total += v; continue; }
-          const q = qget(k+'USDT');
-          if(q) total += v * q.mid;
+          if(k==='USDT'){ total+=v; continue; }
+          const q=qget(k+'USDT'); if(q) total+= v*q.mid;
         }
         return total;
       }
 
-      // Прогноз PnL если выйти сейчас из текущего asset в USDT с учётом комиссий
       function projectedExitPNL(){
         if(asset==='USDT') return 0;
         const qty = balances[asset] || 0;
-        const q = qget(asset+'USDT');
-        if(!q) return 0;
+        const q = qget(asset+'USDT'); if(!q) return 0;
         const gross = qty * q.mid;
         const net = Math.max(0, gross * (1 - FEE_RATE) - FEE_GAME);
-        // pos.entryUSDT — сколько USDT (нетто) было потрачено на текущий asset
         const entry = (pos.asset===asset) ? pos.entryUSDT : 0;
         return net - entry;
       }
 
       function updatePositionOnBuy(toAsset, qtyBought, netUSDTSpent){
-        if(pos.asset!==toAsset){
-          pos = { asset: toAsset, qty: 0, entryUSDT: 0 };
-        }
-        // усредняем
+        if(pos.asset!==toAsset) pos = { asset: toAsset, qty: 0, entryUSDT: 0 };
         pos.qty += qtyBought;
         pos.entryUSDT += netUSDTSpent;
       }
-      function clearPosition(){
-        pos = { asset: 'USDT', qty: 0, entryUSDT: 0 };
-      }
-      function reducePositionOnSell(fromAsset, qtySold, netUSDTReceived){
+      function clearPosition(){ pos = { asset: 'USDT', qty: 0, entryUSDT: 0 }; }
+      function reducePositionOnSell(fromAsset, qtySold){
         if(pos.asset!==fromAsset || pos.qty<=0) return;
         const portion = Math.min(1, qtySold / pos.qty);
         pos.qty -= qtySold;
-        pos.entryUSDT *= (1 - portion); // пропорционально уменьшаем базу
+        pos.entryUSDT *= (1 - portion);
         if(pos.qty<=1e-12) clearPosition();
       }
 
-      // Комиссии вычитаем из самого трейда
+      // ---------- GAME LOGIC ----------
       function jump(toAsset, pctOverride){
         const pct = typeof pctOverride==='number' ? pctOverride : stakePct;
         if(toAsset===asset) return;
@@ -122,7 +117,7 @@
         if(fromAmt<=0) return;
 
         const t=now();
-        const fresh = (q)=> q && t - q.ts <= 1500;
+        const fresh=(q)=> q && t - q.ts <= 1500;
 
         if(from==='USDT'){ 
           const q=qget(toAsset+'USDT'); if(!fresh(q)) return alert('No fresh quote');
@@ -135,8 +130,6 @@
 
           balances.USDT -= fromAmt;
           balances[toAsset]=(balances[toAsset]||0)+qty;
-
-          // апдейт позиции
           updatePositionOnBuy(toAsset, qty, netUSDT);
 
         } else if(toAsset==='USDT'){
@@ -148,32 +141,26 @@
 
           balances[from] -= fromAmt;
           balances.USDT = (balances.USDT||0) + netUSDT;
-
-          // уменьшаем позицию пропорционально
-          reducePositionOnSell(from, fromAmt, netUSDT);
+          reducePositionOnSell(from, fromAmt);
           if((balances[from]||0)<=1e-12 && asset!==toAsset) clearPosition();
 
         } else {
-          // from -> USDT -> toAsset
+          // from -> USDT (sell) -> toAsset (buy)
           const q1=qget(from+'USDT'); const q2=qget(toAsset+'USDT');
           if(!fresh(q1)||!fresh(q2)) return alert('No fresh quote');
 
           const grossUSDT = fromAmt * q1.mid;
-          const feeEx1 = grossUSDT*FEE_RATE;
-          const feeGame1 = FEE_GAME;
-          const midUSDT = Math.max(0, grossUSDT - feeEx1 - feeGame1); // после продажи from
+          const feeEx1 = grossUSDT*FEE_RATE, feeGame1 = FEE_GAME;
+          const midUSDT = Math.max(0, grossUSDT - feeEx1 - feeGame1);
 
-          const feeEx2 = midUSDT*FEE_RATE;
-          const feeGame2 = FEE_GAME;
-          const netUSDT = Math.max(0, midUSDT - feeEx2 - feeGame2); // что реально пошло в покупку
+          const feeEx2 = midUSDT*FEE_RATE, feeGame2 = FEE_GAME;
+          const netUSDT = Math.max(0, midUSDT - feeEx2 - feeGame2);
           const qty = netUSDT / q2.mid;
 
           balances[from] -= fromAmt;
           balances[toAsset]=(balances[toAsset]||0)+qty;
 
-          // позицию по from уменьшаем
-          reducePositionOnSell(from, fromAmt, midUSDT);
-          // позицию по to увеличиваем
+          reducePositionOnSell(from, fromAmt);
           updatePositionOnBuy(toAsset, qty, netUSDT);
         }
 
@@ -181,159 +168,128 @@
         redrawHUD();
       }
 
-      // Рендер
-      let lastEquity = START_EQUITY;
-      let animEquity = START_EQUITY;
-
+      // ---------- TRENDS / DRAW ----------
       function trendPct(sym){
-        const q = qget(sym);
-        if(!q || !q.hist || q.hist.length<2) return 0;
-        const t = now();
-        // точка ~5с назад
-        let base = q.hist[0];
+        const q=qget(sym); if(!q || !q.hist || q.hist.length<2) return 0;
+        const t=now();
+        let base=q.hist[0];
         for(let i=q.hist.length-1;i>=0;i--){
           if(t - q.hist[i].ts >= TREND_WINDOW_MS){ base = q.hist[i]; break; }
           base = q.hist[0];
         }
-        const baseMid = base.mid;
-        if(!baseMid) return 0;
+        const baseMid = base.mid || 0; if(!baseMid) return 0;
         return (q.mid - baseMid) / baseMid * 100;
       }
 
       function bestAndWorst(){
-        let best = {sym:null,pct:-Infinity}, worst={sym:null,pct:Infinity};
+        let best={sym:null,pct:-Infinity}, worst={sym:null,pct:Infinity};
         for(const s of TICKERS){
           const p=trendPct(s);
           if(p>best.pct) best={sym:s,pct:p};
           if(p<worst.pct) worst={sym:s,pct:p};
         }
-        return {best, worst};
+        return {best,worst};
       }
 
       function drawSpark(sym, x, y, w, h){
         const q=qget(sym);
         if(!q || !q.hist || q.hist.length<2) return;
-        const hist = q.hist;
-        // нормализуем по min/max
+        const hist=q.hist;
         let min=Infinity, max=-Infinity;
         for(const p of hist){ if(p.mid<min) min=p.mid; if(p.mid>max) max=p.mid; }
         if(min===max){ min -= 1e-9; max += 1e-9; }
         ctx.beginPath();
         for(let i=0;i<hist.length;i++){
-          const p = hist[i];
-          const tNorm = (p.ts - hist[0].ts) / (hist[hist.length-1].ts - hist[0].ts || 1);
+          const p=hist[i];
+          const tNorm=(p.ts - hist[0].ts) / (hist[hist.length-1].ts - hist[0].ts || 1);
           const xx = x + tNorm * w;
           const yy = y + h - ((p.mid - min)/(max - min)) * h;
-          if(i===0) ctx.moveTo(xx, yy); else ctx.lineTo(xx, yy);
+          if(i===0) ctx.moveTo(xx,yy); else ctx.lineTo(xx,yy);
         }
-        ctx.strokeStyle = '#aaa';
-        ctx.lineWidth = 1;
-        ctx.stroke();
+        ctx.strokeStyle='#aaa'; ctx.lineWidth=1; ctx.stroke();
       }
 
+      let lastEquity=START_EQUITY, animEquity=START_EQUITY;
+
       function loop(){
-        cv.width=innerWidth; cv.height=innerHeight; 
-        const W=cv.width,H=cv.height;
+        cv.width=innerWidth; cv.height=innerHeight;
+        const W=cv.width, H=cv.height;
         ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H);
 
-        // лидеры/аутсайдеры
-        const {best, worst} = bestAndWorst();
+        const {best,worst}=bestAndWorst();
 
-        // кошелёк
-        const eq = equityUSDT();
-        animEquity += (eq - animEquity) * 0.15;
+        // WALLET column
+        const eq = equityUSDT(); animEquity += (eq - animEquity) * 0.15;
         const colH = 160 + Math.max(0, animEquity - START_EQUITY) * (80/50);
-        const walletX = 20, walletW = Math.min(120, Math.max(90, W*0.08));
+        const walletX=20, walletW=Math.min(120, Math.max(90, W*0.08));
         const walletColor = eq > lastEquity + 0.01 ? '#2ecc71' : (eq < lastEquity - 0.01 ? '#e74c3c' : '#1e90ff');
-
         const wy = H - colH - 40;
-        ctx.fillStyle = walletColor;
-        ctx.fillRect(walletX, wy, walletW, colH);
-        ctx.strokeStyle = '#555';
-        ctx.strokeRect(walletX, wy, walletW, colH);
-        ctx.fillStyle = '#fff';
-        ctx.font = 'bold 14px sans-serif';
-        ctx.fillText('WALLET', walletX + 8, wy + 20);
-        ctx.fillText('Eq: ' + fmt(eq), walletX + 8, wy + 40);
-        const pnlPct = ((eq - START_EQUITY) / START_EQUITY) * 100;
-        ctx.fillText('PnL: ' + fmt(pnlPct, 1) + '%', walletX + 8, wy + 60);
 
-        // колонны тикеров с трендом
+        ctx.fillStyle=walletColor; ctx.fillRect(walletX, wy, walletW, colH);
+        ctx.strokeStyle='#555'; ctx.lineWidth=1; ctx.strokeRect(walletX, wy, walletW, colH);
+        ctx.fillStyle='#fff'; ctx.font='bold 14px sans-serif';
+        ctx.fillText('WALLET', walletX+8, wy+20);
+        ctx.fillText('Eq: '+fmt(eq), walletX+8, wy+40);
+        const pnlPct=((eq-START_EQUITY)/START_EQUITY)*100;
+        ctx.fillText('PnL: '+fmt(pnlPct,1)+'%', walletX+8, wy+60);
+
+        // TICKERS columns
         const usableWidth = W - (walletX + walletW + 30) - 20;
         const startX = walletX + walletW + 30;
         const cw = Math.max(100, usableWidth / TICKERS.length - 20);
         const baseYCols = H*0.65;
 
         TICKERS.forEach((sym,i)=>{
-          const chg = trendPct(sym); // % за 5с
-
-          // лёгкое «дрожание» у лидера
+          const chg = trendPct(sym);
           const isLeader = best.sym===sym;
           const shake = isLeader ? Math.sin(Date.now()/100) * 3 : 0;
 
-          // высота и цвет колонны зависят от тренда
-          const trendBoost = Math.max(-1, Math.min(1, chg/1.5)); // ограничим влияние
-          const h = 120 + trendBoost * 30; // «дышит» по тренду
-          const x = startX + i * (cw + 20) + shake;
+          const trendBoost = Math.max(-1, Math.min(1, chg/1.5));
+          const h = 120 + trendBoost * 30;
+          const x = startX + i*(cw+20) + shake;
           const y = baseYCols - h/2;
 
           const isCurrent = (asset+'USDT'===sym) || (asset==='USDT' && sym.endsWith('USDT'));
-          let fill = '#222';
-          if(chg > 0.02) fill = '#143d1f'; // зелёный фон при росте
-          if(chg < -0.02) fill = '#3a1515'; // красный фон при падении
-          if(isCurrent) fill = '#1e90ff';
+          let fill='#222'; if(chg>0.02) fill='#143d1f'; if(chg<-0.02) fill='#3a1515'; if(isCurrent) fill='#1e90ff';
 
-          ctx.fillStyle = fill;
-          ctx.fillRect(x,y,cw,h);
+          ctx.fillStyle = fill; ctx.fillRect(x,y,cw,h);
 
-          // рамки: лидер — неоновая, аутсайдер — красная
-          if(isLeader){
-            ctx.strokeStyle = '#00ffae';
-            ctx.lineWidth = 3;
-          } else if (worst.sym===sym){
-            ctx.strokeStyle = '#ff3b3b';
-            ctx.lineWidth = 2;
-          } else {
-            ctx.strokeStyle = '#555';
-            ctx.lineWidth = 1;
-          }
-          ctx.strokeRect(x,y,cw,h);
-          ctx.lineWidth = 1;
+          // рамки: лидер — неон, HOT — золото, лузер — красный, остальное — серый
+          if (isLeader){ ctx.strokeStyle='#00ffae'; ctx.lineWidth=3; }
+          else if (HOT_SYM===sym){ ctx.strokeStyle='#ffd54a'; ctx.lineWidth=3; }
+          else if (worst.sym===sym){ ctx.strokeStyle='#ff3b3b'; ctx.lineWidth=2; }
+          else { ctx.strokeStyle='#555'; ctx.lineWidth=1; }
+          ctx.strokeRect(x,y,cw,h); ctx.lineWidth=1;
 
-          // подписи
+          // labels
           ctx.fillStyle='#fff'; ctx.font='bold 14px sans-serif';
-          ctx.fillText(sym,x+8,y+20);
-          const q=qget(sym); 
-          if(q){ 
-            ctx.fillText('mid: '+fmt(q.mid),x+8,y+38);
+          const hotTag = (HOT_SYM===sym) ? ' [HOT]' : '';
+          ctx.fillText(sym + hotTag, x+8, y+20);
+          const q=qget(sym);
+          if(q){
+            ctx.fillText('mid: '+fmt(q.mid), x+8, y+38);
             const arrow = chg>0 ? '↑' : (chg<0 ? '↓' : '→');
             ctx.fillStyle = chg>0 ? '#2ecc71' : (chg<0 ? '#e74c3c' : '#d0d0d0');
             ctx.fillText(`${arrow} ${fmt(chg,2)}%/5s`, x+8, y+56);
-            // спарклайн
             drawSpark(sym, x+8, y+h-34, cw-16, 26);
           }
         });
 
-        lastEquity = eq;
+        lastEquity=eq;
         requestAnimationFrame(loop);
       }
 
-      // клик по колонне — прыжок (Shift = 50% разово)
+      // ---------- INPUT ----------
       cv.addEventListener('click', (e)=>{
-        const rect=cv.getBoundingClientRect(); 
-        const x=e.clientX-rect.left; 
-        const y=e.clientY-rect.top;
+        const rect=cv.getBoundingClientRect(); const x=e.clientX-rect.left; const y=e.clientY-rect.top;
         const W=cv.width, H=cv.height;
 
-        // кошелёк — не кликабелен
-        const walletX = 20, walletW = Math.min(120, Math.max(90, W*0.08));
+        // ignore wallet
+        const walletX=20, walletW=Math.min(120, Math.max(90, W*0.08));
         const colH = 160 + Math.max(0, equityUSDT() - START_EQUITY) * (80/50);
         const wy = H - colH - 40;
-        if(x>=walletX && x<=walletX+walletW && y>=wy && y<=wy+colH){
-          return;
-        }
+        if(x>=walletX && x<=walletX+walletW && y>=wy && y<=wy+colH) return;
 
-        // вычисляем индекс тикера
         const usableWidth = W - (walletX + walletW + 30) - 20;
         const startX = walletX + walletW + 30;
         const cw = Math.max(100, usableWidth / TICKERS.length - 20);
@@ -343,17 +299,15 @@
         if(idx < 0 || idx >= TICKERS.length) return;
 
         const colX = startX + idx*stride;
-        const ch = 120; // базовая высота для попадания
+        const ch = 120;
         const colY = H*0.65 - ch/2;
         if(!(x>=colX && x<=colX+cw && y>=colY && y<=colY+ch)) return;
 
-        const sym=TICKERS[idx]; 
-        const to=sym.replace('USDT',''); 
+        const sym=TICKERS[idx]; const to=sym.replace('USDT','');
         const pct = e.shiftKey ? 0.5 : undefined;
         jump(to, pct);
       });
 
-      // горячие клавиши для ставки и «jump to leader»
       window.addEventListener('keydown', (e)=>{
         if(e.key==='1') { stakePct=0.10; redrawHUD(); }
         if(e.key==='2') { stakePct=0.25; redrawHUD(); }
@@ -369,30 +323,50 @@
         }
       });
 
-      // Binance WS multi-stream
-      const streams=TICKERS.map(s=>s.toLowerCase()+'@bookTicker').join('/');
-      const ws=new WebSocket('wss://stream.binance.com:9443/stream?streams='+streams);
-      ws.onmessage=(ev)=>{
-        const m=JSON.parse(ev.data); 
-        const d=m.data;
-        const t=now();
-        const symbol=d.s;
-        const midPx=(Number(d.b)+Number(d.a))/2;
-        const prev = qmap[symbol];
-        const entry = { bid:Number(d.b), ask:Number(d.a), ts:t, mid:midPx, hist: (prev?.hist||[]) };
-        // пушим в историю
-        entry.hist.push({ts:t, mid:midPx});
-        // чистим старше 20с
-        const cutoff = t - HIST_MAX_MS;
-        while(entry.hist.length && entry.hist[0].ts < cutoff) entry.hist.shift();
-        qmap[symbol] = entry;
+      // ---------- DATA FEEDS ----------
+      function reopenWS(){
+        try { ws && ws.close(); } catch {}
+        const streams=TICKERS.map(s=>s.toLowerCase()+'@bookTicker').join('/');
+        ws = new WebSocket('wss://stream.binance.com:9443/stream?streams='+streams);
+        ws.onmessage=(ev)=>{
+          const m=JSON.parse(ev.data);
+          const d=m.data;
+          const t=now();
+          const symbol=d.s;
+          const midPx=(Number(d.b)+Number(d.a))/2;
+          const prev=qmap[symbol];
+          const entry={ bid:Number(d.b), ask:Number(d.a), ts:t, mid:midPx, hist:(prev?.hist||[]) };
+          entry.hist.push({ts:t, mid:midPx});
+          const cutoff=t - HIST_MAX_MS;
+          while(entry.hist.length && entry.hist[0].ts < cutoff) entry.hist.shift();
+          qmap[symbol]=entry;
 
-        const lastTs=t; elLag.textContent=String(Math.max(0,now()-lastTs));
-        elEquity.textContent = fmt(equityUSDT());
-        elExit.textContent = fmt(projectedExitPNL());
-      };
+          elLag.textContent=String(Math.max(0, now()-t));
+          elEquity.textContent=fmt(equityUSDT());
+          elExit.textContent=fmt(projectedExitPNL());
+        };
+      }
 
-      redrawHUD(); loop();
+      async function addMostVolatilePair(){
+        try{
+          const res = await fetch('https://api.binance.com/api/v3/ticker/24hr');
+          const all = await res.json();
+          const bad = /(UPUSDT|DOWNUSDT|BULLUSDT|BEARUSDT|[0-9]LUSDT|[0-9]SUSUT|FDUSDUSDT|TUSDUSDT|USDCUSDT|USDTUSDT)$/i;
+          const usdt = all.filter(r => typeof r.symbol==='string' && r.symbol.endsWith('USDT') && !bad.test(r.symbol));
+          usdt.sort((a,b)=> Math.abs(Number(b.priceChangePercent)) - Math.abs(Number(a.priceChangePercent)));
+          const pick = usdt.find(r => !TICKERS.includes(r.symbol));
+          if(!pick) return;
+          HOT_SYM = pick.symbol;
+          TICKERS = [...TICKERS, HOT_SYM];
+          reopenWS();
+        }catch(e){ console.warn('Volatility pick failed', e); }
+      }
+
+      // ---------- START ----------
+      redrawHUD();
+      reopenWS();
+      addMostVolatilePair();
+      loop();
     </script>
   </body>
 </html>
