@@ -13,15 +13,18 @@
   </head>
   <body>
     <div class="hud">
+      <div class="pill">Equity (USDT): <span id="equity">100.00</span></div>
       <div class="pill">Balance USDT: <span id="bal">100.00</span></div>
       <div class="pill">Asset: <span id="asset">USDT</span></div>
       <div class="pill">Lag: <span id="lag">—</span> ms</div>
       <div class="pill btn" id="panic">Panic to USDT</div>
-      <div class="pill">Fee model: 0.1% + 0.01 USDT</div>
+      <div class="pill">Stake: <span id="stakeLabel">25%</span></div>
+      <div class="pill">[1]=10% [2]=25% [3]=50% [4]=100%</div>
+      <div class="pill">Fee: 0.1% + 0.01 USDT</div>
     </div>
     <canvas id="cv"></canvas>
     <div class="footer">
-      <div class="pill">Click a column to jump. Shift-click = 50%.</div>
+      <div class="pill">Click a column to jump. Shift-click = 50% once.</div>
       <div class="pill">Demo only. Prices: Binance bookTicker.</div>
     </div>
     <script>
@@ -29,61 +32,218 @@
       const qmap={};
       let asset='USDT';
       let balances={USDT:100};
+      let stakePct=0.25; // 25% по умолчанию
+      const START_EQUITY=100;
+
       const FEE_RATE=0.001; // 0.1%
-      const FEE_GAME=0.01;  // USDT fixed
+      const FEE_GAME=0.01;  // 0.01 USDT фикс
+
       const cv=document.getElementById('cv');
       const ctx=cv.getContext('2d');
       const elBal=document.getElementById('bal');
       const elAsset=document.getElementById('asset');
       const elLag=document.getElementById('lag');
+      const elStake=document.getElementById('stakeLabel');
+      const elEquity=document.getElementById('equity');
+
       document.getElementById('panic').onclick=()=>jump('USDT',1);
 
-      function fmt(n){return (Number(n)||0).toFixed(2)}
+      function fmt(n, d=2){return (Number(n)||0).toFixed(d)}
       function mid(q){return (q.bid+q.ask)/2}
-      function quote(sym){return qmap[sym]}
-      function redraw(){elBal.textContent=fmt(balances.USDT||0); elAsset.textContent=asset}
-
-      function jump(toAsset, pct){
-        if(toAsset===asset)return;
-        const from=asset; const fromAmt=(balances[from]||0)*pct; if(fromAmt<=0)return;
-        // pick symbol and price
-        let sym,px; const now=Date.now();
-        if(from==='USDT'){ sym=toAsset+'USDT'; const q=quote(sym); if(!q||now-q.ts>1500)return alert('No fresh quote'); px=mid(q); const qty=fromAmt/px; balances[from]-=fromAmt; balances[toAsset]=(balances[toAsset]||0)+qty; }
-        else if(toAsset==='USDT'){ sym=from+'USDT'; const q=quote(sym); if(!q||now-q.ts>1500)return alert('No fresh quote'); px=mid(q); const usdt=fromAmt*px; balances[from]-=fromAmt; balances.USDT=(balances.USDT||0)+usdt; }
-        else { // via USDT same mid for demo
-          sym=from+'USDT'; const q=quote(sym); if(!q||now-q.ts>1500)return alert('No fresh quote'); px=mid(q); const usdt=fromAmt*px; const q2=quote(toAsset+'USDT'); if(!q2||now-q2.ts>1500)return alert('No fresh quote'); const px2=mid(q2); const qty=usdt/px2; balances[from]-=fromAmt; balances[toAsset]=(balances[toAsset]||0)+qty; }
-        // fees
-        const notionalUSDT = from==='USDT' ? fromAmt : (toAsset==='USDT' ? balances.USDT-(balances.USDT-fromAmt*px) : fromAmt*px);
-        const feeEx = notionalUSDT*FEE_RATE; if((balances.USDT||0)<FEE_GAME) return alert('Not enough USDT for game fee');
-        balances.USDT = (balances.USDT||0) - (feeEx + FEE_GAME);
-        asset=toAsset; redraw();
+      function qget(sym){return qmap[sym]}
+      function redrawHUD(){
+        elBal.textContent=fmt(balances.USDT||0);
+        elAsset.textContent=asset;
+        elStake.textContent=Math.round(stakePct*100)+'%';
+        elEquity.textContent=fmt(equityUSDT());
       }
 
-      // canvas loop
+      // Подсчёт общего equity в USDT-эквиваленте
+      function equityUSDT(){
+        let total = 0;
+        for(const [k,v] of Object.entries(balances)){
+          if(k==='USDT'){ total += v; continue; }
+          const q = qget(k+'USDT');
+          if(q) total += v * mid(q);
+        }
+        return total;
+      }
+
+      // Новая логика: комиссии вычитаем из самого трейда
+      function jump(toAsset, pctOverride){
+        const pct = typeof pctOverride==='number' ? pctOverride : stakePct;
+        if(toAsset===asset) return;
+        const from=asset;
+        const fromAmt=(balances[from]||0)*pct;
+        if(fromAmt<=0) return;
+
+        const now=Date.now();
+        const fresh = (q)=> q && now - q.ts <= 1500;
+
+        if(from==='USDT'){ 
+          const q=qget(toAsset+'USDT'); if(!fresh(q)) return alert('No fresh quote');
+          const px=mid(q);
+          const notionalUSDT = fromAmt;
+          const feeEx = notionalUSDT*FEE_RATE;
+          const feeGame = FEE_GAME;
+          const netUSDT = notionalUSDT - feeEx - feeGame;
+          if(netUSDT<=0) return alert('Too small amount for fees');
+          const qty = netUSDT / px;
+
+          balances.USDT -= fromAmt;
+          balances[toAsset]=(balances[toAsset]||0)+qty;
+
+        } else if(toAsset==='USDT'){
+          const q=qget(from+'USDT'); if(!fresh(q)) return alert('No fresh quote');
+          const px=mid(q);
+          const grossUSDT = fromAmt * px;
+          const feeEx = grossUSDT*FEE_RATE;
+          const feeGame = FEE_GAME;
+          const netUSDT = Math.max(0, grossUSDT - feeEx - feeGame);
+
+          balances[from] -= fromAmt;
+          balances.USDT = (balances.USDT||0) + netUSDT;
+
+        } else {
+          // from -> USDT -> toAsset
+          const q1=qget(from+'USDT'); const q2=qget(toAsset+'USDT');
+          if(!fresh(q1)||!fresh(q2)) return alert('No fresh quote');
+          const px1=mid(q1), px2=mid(q2);
+
+          const grossUSDT = fromAmt * px1;
+          const feeEx = grossUSDT*FEE_RATE;
+          const feeGame = FEE_GAME;
+          const netUSDT = Math.max(0, grossUSDT - feeEx - feeGame);
+          const qty = netUSDT / px2;
+
+          balances[from] -= fromAmt;
+          balances[toAsset]=(balances[toAsset]||0)+qty;
+        }
+
+        asset=toAsset;
+        redrawHUD();
+      }
+
+      // Рендер
+      let lastEquity = START_EQUITY;
+      let animEquity = START_EQUITY;
+
       function loop(){
-        cv.width=innerWidth; cv.height=innerHeight; const W=cv.width,H=cv.height; ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H);
-        const cw=Math.max(80,W/TICKERS.length-40);
+        // размеры
+        cv.width=innerWidth; cv.height=innerHeight; 
+        const W=cv.width,H=cv.height;
+        ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H);
+
+        // вычисления для кошелька
+        const eq = equityUSDT();
+        // плавная анимация столбца equity
+        animEquity += (eq - animEquity) * 0.15;
+
+        // шкала высоты: базовая высота при 100 USDT = 160px, каждый +50 USDT ≈ +80px
+        const baseY = H*0.15;
+        const colH = 160 + Math.max(0, animEquity - START_EQUITY) * (80/50);
+        const walletX = 20, walletW = Math.min(120, Math.max(90, W*0.08));
+
+        // цвет в зависимости от изменения equity
+        const rising = eq > lastEquity + 0.01;
+        const falling = eq < lastEquity - 0.01;
+        const walletColor = rising ? '#2ecc71' : (falling ? '#e74c3c' : '#1e90ff');
+
+        // колонна кошелька
+        const wy = H - colH - 40;
+        ctx.fillStyle = walletColor;
+        ctx.fillRect(walletX, wy, walletW, colH);
+        ctx.strokeStyle = '#555';
+        ctx.strokeRect(walletX, wy, walletW, colH);
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 14px sans-serif';
+        ctx.fillText('WALLET', walletX + 8, wy + 20);
+        ctx.fillText('Eq: ' + fmt(eq), walletX + 8, wy + 40);
+        const pnlPct = ((eq - START_EQUITY) / START_EQUITY) * 100;
+        ctx.fillText('PnL: ' + fmt(pnlPct, 1) + '%', walletX + 8, wy + 60);
+
+        // тикер-колонны
+        const usableWidth = W - (walletX + walletW + 30) - 20;
+        const startX = walletX + walletW + 30;
+        const cw = Math.max(80, usableWidth / TICKERS.length - 20);
+
         TICKERS.forEach((sym,i)=>{
-          const x=(i*(W/TICKERS.length))+20; const y=H*0.6 + Math.sin((Date.now()/500)+(i*0.7))*H*0.15; const h=120;
-          ctx.fillStyle=(asset+'USDT'===sym || (asset==='USDT' && sym.endsWith('USDT')))?'#1e90ff':'#222';
-          ctx.fillRect(x,y,cw,h); ctx.strokeStyle='#555'; ctx.strokeRect(x,y,cw,h);
-          ctx.fillStyle='#fff'; ctx.font='bold 14px sans-serif'; ctx.fillText(sym,x+8,y+22);
-          const q=qmap[sym]; if(q){ ctx.fillText('mid: '+mid(q).toFixed(2),x+8,y+42); }
+          const x = startX + i * (cw + 20);
+          const y = H*0.6 + Math.sin((Date.now()/500)+(i*0.7))*H*0.15;
+          const h = 120;
+          // текущий ассет подсвечиваем
+          const isCurrent = (asset+'USDT'===sym) || (asset==='USDT' && sym.endsWith('USDT'));
+          ctx.fillStyle = isCurrent ? '#1e90ff' : '#222';
+          ctx.fillRect(x,y,cw,h); 
+          ctx.strokeStyle='#555'; ctx.strokeRect(x,y,cw,h);
+          ctx.fillStyle='#fff'; ctx.font='bold 14px sans-serif';
+          ctx.fillText(sym,x+8,y+22);
+          const q=qmap[sym]; 
+          if(q){ ctx.fillText('mid: '+fmt(mid(q)),x+8,y+42); }
         });
+
+        lastEquity = eq;
         requestAnimationFrame(loop);
       }
 
-      // click handler
+      // клик по колонне — прыжок (Shift = 50% разово)
       cv.addEventListener('click', (e)=>{
-        const rect=cv.getBoundingClientRect(); const x=e.clientX-rect.left; const W=cv.width; const idx=Math.floor((x-20)/(W/TICKERS.length)); if(idx<0||idx>=TICKERS.length)return; const sym=TICKERS[idx]; const to=sym.replace('USDT',''); const pct=e.shiftKey?0.5:1; jump(to,pct);
+        const rect=cv.getBoundingClientRect(); 
+        const x=e.clientX-rect.left; 
+        const y=e.clientY-rect.top;
+        const W=cv.width, H=cv.height;
+
+        // проверим клики по кошельку — игнорируем, он не «прыгает»
+        const walletX = 20, walletW = Math.min(120, Math.max(90, W*0.08));
+        const colH = 160 + Math.max(0, equityUSDT() - START_EQUITY) * (80/50);
+        const wy = H - colH - 40;
+        if(x>=walletX && x<=walletX+walletW && y>=wy && y<=wy+colH){
+          return; // кошелёк — только индикатор
+        }
+
+        // вычисляем индекс тикера
+        const usableWidth = W - (walletX + walletW + 30) - 20;
+        const startX = walletX + walletW + 30;
+        const cw = Math.max(80, usableWidth / TICKERS.length - 20);
+
+        const relX = x - startX;
+        if(relX < 0) return;
+        const stride = cw + 20;
+        const idx = Math.floor(relX / stride);
+        if(idx < 0 || idx >= TICKERS.length) return;
+
+        // проверка попадания по прямоугольнику
+        const colX = startX + idx*stride;
+        const colY = H*0.6 + Math.sin((Date.now()/500)+(idx*0.7))*H*0.15;
+        const colH2 = 120;
+        if(!(x>=colX && x<=colX+cw && y>=colY && y<=colY+colH2)) return;
+
+        const sym=TICKERS[idx]; 
+        const to=sym.replace('USDT',''); 
+        const pct = e.shiftKey ? 0.5 : undefined;
+        jump(to, pct);
+      });
+
+      // горячие клавиши для ставки
+      window.addEventListener('keydown', (e)=>{
+        if(e.key==='1') { stakePct=0.10; redrawHUD(); }
+        if(e.key==='2') { stakePct=0.25; redrawHUD(); }
+        if(e.key==='3') { stakePct=0.50; redrawHUD(); }
+        if(e.key==='4') { stakePct=1.00; redrawHUD(); }
       });
 
       // Binance WS multi-stream
       const streams=TICKERS.map(s=>s.toLowerCase()+'@bookTicker').join('/');
       const ws=new WebSocket('wss://stream.binance.com:9443/stream?streams='+streams);
-      let lastTs=0; ws.onmessage=(ev)=>{ const m=JSON.parse(ev.data); const d=m.data; qmap[d.s]={bid:Number(d.b),ask:Number(d.a),ts:Date.now()}; lastTs=qmap[d.s].ts; elLag.textContent=String(Math.max(0,Date.now()-lastTs)); };
+      ws.onmessage=(ev)=>{
+        const m=JSON.parse(ev.data); const d=m.data;
+        qmap[d.s]={bid:Number(d.b),ask:Number(d.a),ts:Date.now()};
+        const lastTs=qmap[d.s].ts; elLag.textContent=String(Math.max(0,Date.now()-lastTs));
+        // equity меняется — обновим HUD
+        elEquity.textContent = fmt(equityUSDT());
+      };
 
-      redraw(); loop();
+      redrawHUD(); loop();
     </script>
   </body>
 </html>
